@@ -1,0 +1,116 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+// ===== WiFi/AP =====
+const char* SSID     = "AX";
+const char* PASSWORD = "84117190";
+
+// 브로드캐스트 전송(수신기는 모니터 모드로 CSI 캡처)
+const IPAddress UDP_DST(255, 255, 255, 255);
+const uint16_t  UDP_PORT = 5500;
+
+// ===== TDMA (안정형 권장값) =====
+#define TX_ID        3   // <<< 보드마다 1,2,3...
+#define SLOT_INDEX   2   // <<< 보드마다 0,1,2 (서로 달라야 함)
+const uint32_t NUM_SLOTS = 3;   // 송신기 수
+const uint32_t SLOT_MS   = 18;  // 슬롯 길이(ms)
+const uint32_t GUARD_MS  = 2;   // 슬롯 말미 무송신 구간(ms)
+const uint32_t FRAME_MS  = NUM_SLOTS * SLOT_MS;   // 한 사이클(ms)
+
+// 슬롯 내 다중 패킷(안정형: 3패킷 → ~55.6 Hz/링크)
+const int PACKETS_PER_SLOT = 3;
+
+WiFiUDP udp;
+
+// 고정 길이 페이로드(파서/동기화용 메타 포함)
+struct __attribute__((packed)) Payload {
+  uint32_t magic;       // 0x0C51C51 식별자
+  uint16_t tx_id;       // 보드 ID
+  uint16_t slot_index;  // 슬롯 번호
+  uint32_t frame_idx;   // TDMA 프레임 카운터
+  uint64_t mono_us;     // 송신 시각(us, esp_timer)
+  uint8_t  pad[48];     // 길이 고정(≥64B 권장)
+};
+
+static inline uint64_t now_us() { return esp_timer_get_time(); }
+
+// 프레임 진행 위치(ms)
+static inline uint32_t ms_in_frame(uint64_t t0_us) {
+  return ((now_us() - t0_us) / 1000) % FRAME_MS;
+}
+
+// 프레임 내 target(ms)까지 가볍게 대기(지터 흡수용 소형 루프)
+static inline void wait_until_inframe_ms(uint64_t t0_us, uint32_t target_ms) {
+  // target_ms를 살짝 앞당겨 busy-wait 길이 단축
+  while (true) {
+    uint32_t pos = ms_in_frame(t0_us);
+    if ((int32_t)(target_ms - pos) <= 0) break;
+    // 작은 슬립: WiFi 스택과 양보
+    delayMicroseconds(120);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.persistent(false);
+  WiFi.setSleep(false);                 // 절전 off → 타이밍 안정화
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SSID, PASSWORD);
+
+  Serial.print("Connecting");
+  while (WiFi.status() != WL_CONNECTED) { delay(200); Serial.print("."); }
+  Serial.printf("\nConnected. IP=%s  RSSI=%d dBm\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+
+  udp.begin(UDP_PORT);
+  Serial.println("UDP ready.");
+}
+
+void loop() {
+  static uint64_t t0_us = now_us();        // TDMA 기준 시각(부팅 기준)
+  const uint32_t my_start_ms = SLOT_INDEX * SLOT_MS;
+  const uint32_t my_end_ms   = my_start_ms + SLOT_MS - GUARD_MS; // 유효 송신 구간
+  const float usable_ms      = (float)(SLOT_MS - GUARD_MS);
+  const float gap_ms         = usable_ms / PACKETS_PER_SLOT;     // 균등 간격
+
+  const uint32_t pos = ms_in_frame(t0_us);
+  if (pos >= my_start_ms && pos < my_end_ms) {
+    static uint32_t last_sent_frame = 0xFFFFFFFF;
+    const uint32_t elapsed_ms = (now_us() - t0_us) / 1000;
+    const uint32_t frame_idx  = elapsed_ms / FRAME_MS;
+
+    if (frame_idx != last_sent_frame) {
+      last_sent_frame = frame_idx;
+
+      // 슬롯 내 패킷들을 "구간 중앙" 쪽으로 배치(가드와 경계 여유)
+      for (int i = 0; i < PACKETS_PER_SLOT; ++i) {
+        // 타겟 시각(ms, 프레임 내): 시작 + (i+0.5)*간격  (경계 여유 확보)
+        uint32_t target = (uint32_t)(my_start_ms + (i + 0.5f) * gap_ms);
+        if (target >= my_end_ms) break; // 혹시 계산상 넘어가면 방지
+        wait_until_inframe_ms(t0_us, target);
+
+        Payload p{};
+        p.magic      = 0x0C51C51;
+        p.tx_id      = (uint16_t)TX_ID;
+        p.slot_index = (uint16_t)SLOT_INDEX;
+        p.frame_idx  = frame_idx;
+        p.mono_us    = now_us();
+        memset(p.pad, 0, sizeof(p.pad));
+
+        udp.beginPacket(UDP_DST, UDP_PORT);
+        udp.write(reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+        udp.endPacket();
+      }
+
+      // 상태 로그(초당 1회 내외)
+      if ((frame_idx % (1000 / FRAME_MS)) == 0) {
+        Serial.printf("[TX%u] frame=%lu slot=%u sent %d pkts\n",
+                      (unsigned)TX_ID, (unsigned long)frame_idx,
+                      (unsigned)SLOT_INDEX, PACKETS_PER_SLOT);
+      }
+    }
+  }
+
+  // 루프 주기: 너무 바쁘지 않게 소폭 슬립
+  delayMicroseconds(300);
+}
