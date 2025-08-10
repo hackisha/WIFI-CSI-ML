@@ -327,7 +327,7 @@ def mode_guided(nicname: str, save_root: str):
     + 포지션이 바뀔 때마다 '포지션 이동/준비 대기' 실행(첫 포지션 포함)
     """
     print()
-    banner_box([f"가이드 모드(무음) — 저장 경로: {save_root}"], fg='bright_yellow')
+    banner_box([f"가이드 모드 — 저장 경로: {save_root}"], fg='bright_yellow')
     sess = session_dir(save_root)
     ok_line(f"- 세션 폴더: {sess}")
 
@@ -450,7 +450,7 @@ def mode_guided(nicname: str, save_root: str):
     ok_line("\n모든 클립 저장이 완료되었습니다.")
 
 # =====================================================================
-# 모드: MAC 탐색(간단 확인)
+# 모드: MAC 탐색
 # =====================================================================
 
 def mode_discover(nicname: str, seconds: int = 5):
