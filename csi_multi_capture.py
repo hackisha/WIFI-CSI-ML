@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-필수:
-  pip3 install pcap dpkt pandas numpy keyboard
-"""
-
 import os
 import sys
 import time
@@ -26,23 +21,16 @@ try:
 except Exception:
     KEYBOARD_AVAILABLE = False
 
-# ===== pandas FutureWarning 숨김 (빈 DF concat 관련) =====
 warnings.simplefilter("ignore", FutureWarning)
 
 # ===== 사용자 설정(cfg.py) =====
-# cfg.EXTRACTOR_CONFIG['bandwidth'] (MHz) 를 사용합니다.
-import cfg
+import cfg  # cfg.EXTRACTOR_CONFIG['bandwidth'] (MHz)
 
-# ===== 기본 경로/상수 =====
-OUTPUT_ROOT = '../data'
-os.makedirs(OUTPUT_ROOT, exist_ok=True)
-
+# ===== 무선/CSI 상수 =====
 BANDWIDTH_MHZ = cfg.EXTRACTOR_CONFIG.get('bandwidth', 20)  # 20 or 40
-NSUB = int(BANDWIDTH_MHZ * 3.2)  # 서브캐리어 수(기존 규칙: MHz * 3.2)
+NSUB = int(BANDWIDTH_MHZ * 3.2)  # 서브캐리어 수(규칙: MHz * 3.2)
 UDP_PORT = 5500
-
-# NIC은 고정
-NIC_NAME = 'wlan0'
+NIC_NAME = 'wlan0'  # 고정
 
 # =====================================================================
 # 터미널 컬러/배너 유틸
@@ -93,15 +81,14 @@ def banner_box(lines, fg='bright_white', bg=None, border_char='═'):
     print(color(border, fg=fg, bg=bg))
     for line in lines:
         s = f"  {line}"
-        # 우측 패딩
         if len(s) < w:
             s = s + ' ' * (w - len(s))
         print(color(s, fg=fg, bg=bg))
     print(color(border, fg=fg, bg=bg))
 
-def banner_ready(delay_sec: int):
+def banner_ready(delay_sec: int, title: str = "준비 시간"):
     lines = [
-        f"준비 시간 {delay_sec}초 - 자세를 잡고 대기하세요",
+        f"{title} {delay_sec}초 - 자세를 잡고 대기하세요",
         "(이 구간은 저장하지 않습니다)"
     ]
     banner_box(lines, fg='bright_cyan')
@@ -117,10 +104,9 @@ def banner_baseline_done():
     banner_box(["베이스라인 완료"], fg='bright_green')
 
 def banner_action(act: str, sec: float):
-    # 빨간 배경 + 흰색 글자(눈에 띄게)
     lines = [
         f"★★★ 동작 수행 시작: '{act}' — {sec:.1f}초 ★★★",
-        "지금 동작을 수행하세요!"
+        "지금 즉시 동작을 수행하세요!"
     ]
     banner_box(lines, fg='bright_white', bg='red', border_char='█')
 
@@ -146,7 +132,7 @@ def err_line(msg: str):
     print(color(msg, fg='bright_red'))
 
 # =====================================================================
-# 유틸
+# 파일/경로 유틸
 # =====================================================================
 
 def normalize_mac_hex(s: str) -> str:
@@ -156,8 +142,15 @@ def normalize_mac_hex(s: str) -> str:
 def unique_tail(mac_hex: str, n: int = 4) -> str:
     return mac_hex[-n:]
 
-def session_dir() -> str:
-    sd = os.path.join(OUTPUT_ROOT, datetime.now().strftime("session_%Y%m%d_%H%M%S"))
+def ensure_dir(path: str) -> str:
+    """입력 경로를 절대경로로 확장하고, 없으면 생성해서 반환."""
+    path = os.path.expanduser(path)
+    path = os.path.abspath(path)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def session_dir(save_root: str) -> str:
+    sd = os.path.join(save_root, datetime.now().strftime("session_%Y%m%d_%H%M%S"))
     os.makedirs(sd, exist_ok=True)
     return sd
 
@@ -214,22 +207,21 @@ def capture_csi(nicname: str,
         try:
             eth = dpkt.ethernet.Ethernet(pkt)
             ip = eth.data
-            if not isinstance(ip, dpkt.ip.IP):      # IPv4만 처리
+            if not isinstance(ip, dpkt.ip.IP):
                 continue
             udp = ip.data
-            if not isinstance(udp, dpkt.udp.UDP):   # UDP만
+            if not isinstance(udp, dpkt.udp.UDP):
                 continue
 
             payload = bytes(udp.data)
             if len(payload) < 18:
                 continue
 
-            # 기존 포맷: [4:10] = 6B MAC 식별 / [18:] = IQ(int16) interleaved
             mac_hex = payload[4:10].hex()
             if allow_macs is not None and mac_hex not in allow_macs:
                 continue
 
-            # (선택) MAC별 다운샘플: 같은 MAC에서 같은 bin이면 스킵
+            # MAC별 다운샘플: 같은 MAC에서 같은 시간 bin이면 스킵
             if per_mac_bin_ms and per_mac_bin_ms > 0:
                 bin_idx = truncate_bin_idx(ts, per_mac_bin_ms)
                 if last_bin_by_mac.get(mac_hex) == bin_idx:
@@ -244,21 +236,18 @@ def capture_csi(nicname: str,
             csi_np = np.frombuffer(raw, dtype=np.int16, count=need).reshape(1, need)
             csi_cmplx = np.fft.fftshift(csi_np[:, ::2] + 1.j * csi_np[:, 1::2], axes=(1,))
 
-            # mac별 빈 DF 생성(명시 dtype)
             if mac_hex not in mac_dict:
                 mac_dict[mac_hex] = make_empty_csi_df(NSUB)
 
-            # 한 줄 DF (스키마 맞추기)
             df_row = pd.DataFrame(csi_cmplx)
             df_row.rename(columns={i: f'_{i}' for i in range(NSUB)}, inplace=True)
-            df_row.insert(0, 'time', float(ts))      # float64
-            df_row.insert(0, 'mac', str(mac_hex))    # object
-            df_row = df_row[mac_dict[mac_hex].columns]  # 컬럼 순서 정렬
+            df_row.insert(0, 'time', float(ts))
+            df_row.insert(0, 'mac', str(mac_hex))
+            df_row = df_row[mac_dict[mac_hex].columns]
 
             mac_dict[mac_hex] = pd.concat([mac_dict[mac_hex], df_row], ignore_index=True)
 
         except Exception:
-            # 손상 프레임 등은 무시
             pass
 
     return mac_dict
@@ -275,23 +264,17 @@ def save_csv(df: pd.DataFrame, path: str):
 # 모드: 저장 전용
 # =====================================================================
 
-def mode_save_only(nicname: str):
+def mode_save_only(nicname: str, save_root: str):
     print()
-    banner_box(["저장 전용 모드"], fg='bright_yellow')
+    banner_box([f"저장 전용 모드 — 저장 경로: {save_root}"], fg='bright_yellow')
 
     base = input("파일 이름 접두어(예: test): ").strip() or "test"
-
-    # 시작 번호(재개 용도)
     start_idx = int(input("시작 번호(기본 1): ").strip() or "1")
-
-    # 반복 횟수('-' 입력 시 무한 반복)
     rpt_text = input("반복 횟수('-' 입력 시 무한 반복): ").strip()
     repeat = -1 if rpt_text == '-' else int(rpt_text or "1")
-
     duration = float(input("캡처 시간(초): ").strip())
     delay = int(input("캡처 전 대기(초): ").strip() or "0")
 
-    # MAC 필터(3대만 지정 추천)
     use_filter = input("특정 MAC만 수집할까요? (y/n): ").strip().lower() == 'y'
     allow = None
     if use_filter:
@@ -299,7 +282,6 @@ def mode_save_only(nicname: str):
         ms = input("예) e0:5a:1b:a0:e7:0c, ec:e3:34:21:a5:20, 38:18:2b:2e:ef:40\n> ").strip()
         allow = {normalize_mac_hex(m) for m in ms.split(',') if m.strip()}
 
-    # MAC별 다운샘플 bin(ms). 빈 입력 시 10, 0 입력 시 끔
     bin_text = input("MAC별 다운샘플(bin ms, 기본 10, 0=끄기): ").strip()
     per_mac_bin_ms: Optional[float] = None if bin_text == "" else float(bin_text)
     if per_mac_bin_ms == 0:
@@ -330,26 +312,29 @@ def mode_save_only(nicname: str):
                 info_line(f"  - {mac} : {len(df):,}행")
             for mac, df in mac_dict.items():
                 fname = f"{base}_{idx}_mac{unique_tail(mac)}_{now_tag}.csv"
-                save_csv(df, os.path.join(OUTPUT_ROOT, fname))
+                save_csv(df, os.path.join(save_root, fname))
 
         idx += 1
 
 # =====================================================================
-# 모드: 가이드(무음, 콘솔 안내만)
+# 모드: 가이드
 # =====================================================================
 
-def mode_guided(nicname: str):
+def mode_guided(nicname: str, save_root: str):
     """
-    콘솔 안내(무음). 세션 폴더에 저장.
     좌표/방향/행동/반복/시작번호 지정 가능.
+    기본값: 포지션 4개(코너 0,1,2,3), 오리엔테이션 0°
+    + 포지션이 바뀔 때마다 '포지션 이동/준비 대기' 실행(첫 포지션 포함)
     """
     print()
-    banner_box(["가이드 모드(무음)"], fg='bright_yellow')
-    sess = session_dir()
+    banner_box([f"가이드 모드(무음) — 저장 경로: {save_root}"], fg='bright_yellow')
+    sess = session_dir(save_root)
     ok_line(f"- 세션 폴더: {sess}")
 
-    # 시작 번호(재개 용도)
     start_idx = int(input("시작 번호(기본 1): ").strip() or "1")
+
+    # ---- 포지션 이동/준비 대기: 각 포지션 시작 직전에 실행(첫 포지션 포함) ----
+    pos_move_delay = int(input("포지션 이동/준비 대기(초, 첫 포지션 포함, 기본 10): ").strip() or "10")
 
     # Diamond-9 좌표(csv 없으면 기본 좌표 사용)
     diamond_csv = 'diamond9_2x2m.csv'
@@ -366,21 +351,24 @@ def mode_guided(nicname: str):
             4:(1.0,0.0), 5:(0.0,1.0), 6:(2.0,1.0), 7:(1.0,2.0), 8:(1.0,1.0)
         }
 
-    pos_text = input("포지션 ID들(콤마, 기본: 0..8 모두): ").strip()
-    pos_ids = [int(x) for x in pos_text.split(',')] if pos_text else list(sorted(grid.keys()))
+    # 기본 포지션: 코너 0,1,2,3
+    pos_default = [p for p in [0,1,2,3] if p in grid.keys()] or list(sorted(grid.keys()))[:4]
+    pos_text = input(f"포지션 ID들(콤마, 기본: {','.join(map(str,pos_default))}): ").strip()
+    pos_ids = [int(x) for x in pos_text.split(',')] if pos_text else pos_default
 
-    ori_text = input("방향(deg, 콤마, 기본: 0,90): ").strip()
-    orientations = [int(x) for x in ori_text.split(',')] if ori_text else [0, 90]
+    # 기본 오리엔테이션: 0°
+    ori_text = input("방향(deg, 콤마, 기본: 0): ").strip()
+    orientations = [int(x) for x in ori_text.split(',')] if ori_text else [0]
 
     actions_text = input("행동들(콤마, 기본: idle,sit_stand,inplace_walk,raise_one_arm): ").strip()
     actions = actions_text.split(',') if actions_text else ['idle','sit_stand','inplace_walk','raise_one_arm']
 
-    repeats = int(input("반복 횟수(기본 3): ").strip() or "3")
+    repeats = int(input("반복 횟수(기본 10): ").strip() or "10")
 
     # 타이밍
     baseline_sec = float(input("베이스라인 시간(초, 기본 0.5): ").strip() or "0.5")
-    action_sec   = float(input("동작 시간(초, 기본 1.0): ").strip() or "1.0")
-    delay_before = int(input("클립 시작 전 대기(초, 기본 2): ").strip() or "2")
+    action_sec   = float(input("동작 시간(초, 기본 2.0): ").strip() or "2.0")
+    delay_before = int(input("클립 시작 전 대기(초, 기본 1): ").strip() or "1")
 
     # MAC 필터
     ms = input("타깃 MAC들(콤마, 콜론 허용, 비우면 전체): ").strip()
@@ -398,8 +386,14 @@ def mode_guided(nicname: str):
 
     ok_line(f"\n총 {total} 클립 예정. 's' 키로 중단 가능, 또는 Ctrl+C.")
 
-    for pos_id in pos_ids:
+    for i, pos_id in enumerate(pos_ids):
         x, y = grid.get(pos_id, (None, None))
+
+        # ---- 각 포지션 시작 직전 대기(첫 포지션 포함) ----
+        if pos_move_delay > 0:
+            banner_ready(pos_move_delay, title="포지션 이동/준비 시간")
+            countdown(pos_move_delay)
+
         for ori in orientations:
             for act in actions:
                 for rep in range(1, repeats + 1):
@@ -411,13 +405,13 @@ def mode_guided(nicname: str):
                         warn_line("사용자 중지(s). 종료합니다.")
                         return
 
-                    # 준비/대기 (저장 안 함)
-                    banner_ready(delay_before)
-                    countdown(delay_before)
+                    # 각 클립 시작 전 대기(저장 안 함)
+                    if delay_before > 0:
+                        banner_ready(delay_before)
+                        countdown(delay_before)
 
                     # 베이스라인 (저장)
                     banner_baseline(baseline_sec)
-                    t0 = time.time()
                     mac_dict = capture_csi(nicname, baseline_sec, allow_macs=allow, per_mac_bin_ms=per_mac_bin_ms)
                     banner_baseline_done()
 
@@ -490,7 +484,11 @@ def mode_discover(nicname: str, seconds: int = 5):
 # =====================================================================
 
 def main():
-    banner_box([f"CSI 다중 수신 도구 — NIC: {NIC_NAME}"], fg='bright_white')
+    default_root = "./data"
+    inp = input(f"저장 경로(기본 {default_root}): ").strip()
+    save_root = ensure_dir(inp if inp else default_root)
+
+    banner_box([f"CSI 다중 수신 도구 — NIC: {NIC_NAME}", f"저장 경로: {save_root}"], fg='bright_white')
 
     print("\n모드를 선택하세요:")
     print("  1 - 저장 전용 모드")
@@ -500,9 +498,9 @@ def main():
 
     try:
         if mode == '1':
-            mode_save_only(NIC_NAME)
+            mode_save_only(NIC_NAME, save_root)
         elif mode == '2':
-            mode_guided(NIC_NAME)
+            mode_guided(NIC_NAME, save_root)
         elif mode == '3':
             sec = int(input("스캔 시간(초, 기본 5): ").strip() or "5")
             mode_discover(NIC_NAME, seconds=sec)
