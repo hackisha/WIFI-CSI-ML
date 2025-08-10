@@ -2,8 +2,8 @@
 #include <WiFiUdp.h>
 
 // ===== WiFi/AP =====
-const char* SSID     = "AX";
-const char* PASSWORD = "84117190";
+const char* SSID     = "";
+const char* PASSWORD = "";
 
 // 브로드캐스트 전송(수신기는 모니터 모드로 CSI 캡처)
 const IPAddress UDP_DST(255, 255, 255, 255);
